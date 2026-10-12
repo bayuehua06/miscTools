@@ -46,8 +46,8 @@ fi
 if [[ $# -eq 2 ]]; then
   OUTPUT=$2
 else
-  if [[ "$INPUT" == *.epub ]]; then
-    OUTPUT="${INPUT%.epub}.pdf"
+  if [[ "$(printf '%s' "${INPUT##*.}" | tr '[:upper:]' '[:lower:]')" == epub ]]; then
+    OUTPUT="${INPUT%.*}.pdf"
   else
     OUTPUT="${INPUT}.pdf"
   fi
