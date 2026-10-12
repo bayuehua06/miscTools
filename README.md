@@ -7,7 +7,7 @@
 | `book2pdf` | 电子书转 PDF，按扩展名自动选择（.epub / .djvu） | 见下两行 |
 | `epub2pdf` | EPUB 转 PDF（Calibre 渲染，默认 A4、边距 12mm） | Calibre |
 | `djvu2pdf` | DjVu 转 PDF（逐页导出 TIFF 后合成） | DjVuLibre、ImageMagick |
-| `md2word` | Markdown 转 APA 7th 学生论文版式 Word | Python 3、python-docx |
+| `md2word` | Markdown 转 APA 7th 学生论文版式 Word | Python 3、python-docx、markdown-it-py |
 | `doctor` | 检查依赖是否就绪 | - |
 
 ## 安装

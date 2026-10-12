@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 try:
+    from markdown_it import MarkdownIt
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT
     from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -76,6 +77,8 @@ FONT_SIZE = Pt(12)
 MARGIN = Inches(1)
 FIRST_LINE_INDENT = Inches(0.5)
 HANGING_INDENT = Inches(0.5)
+CODE_FONT_NAME = "Courier New"
+CODE_FONT_SIZE = Pt(10)
 
 
 @dataclass
@@ -98,41 +101,18 @@ class InlineSeg:
 
 @dataclass
 class Block:
-    kind: str  # heading|para|list_item|blockquote|blank|hr|table
-    level: int = 0
+    kind: str  # heading|para|list_item|blockquote|code|hr|table
+    level: int = 0  # heading: 1–6；list_item: 嵌套深度（0 起）
     ordered: bool = False
     index: int = 0
     segs: List[InlineSeg] = field(default_factory=list)
     raw: str = ""
     # table fields
     rows: List[List[str]] = field(default_factory=list)
+    aligns: List[Optional[str]] = field(default_factory=list)  # left|center|right|None
     table_number: str = ""
     table_title: str = ""
     table_note_segs: List[InlineSeg] = field(default_factory=list)
-
-
-def is_pipe_row(line: str) -> bool:
-    s = line.strip()
-    return "|" in s and not re.match(r"^(-{3,}|\*{3,}|_{3,})\s*$", s)
-
-
-def is_table_separator(line: str) -> bool:
-    s = line.strip().strip("|").strip()
-    if not s:
-        return False
-    parts = [p.strip() for p in s.split("|")]
-    if not parts:
-        return False
-    return all(re.match(r"^:?-{3,}:?$", p) for p in parts if p)
-
-
-def split_table_row(line: str) -> List[str]:
-    s = line.strip()
-    if s.startswith("|"):
-        s = s[1:]
-    if s.endswith("|"):
-        s = s[:-1]
-    return [c.strip() for c in s.split("|")]
 
 
 def is_table_number_text(text: str) -> bool:
@@ -167,32 +147,47 @@ def italic_only_text(segs: List[InlineSeg]) -> Optional[str]:
     return None
 
 
+# APA 表注必须以「Note.」开头；中文用「注.」「注：」「说明：」等。「Note that」「注意」是普通段落
+TABLE_NOTE_RE = re.compile(r"^(?:\*{1,2}|_)?note\.(?:\*{1,2}|_)?\s", re.IGNORECASE)
+CJK_TABLE_NOTE_RE = re.compile(r"^(?:注|说明)\s*[.．:：]")
+
+
 def is_table_note_text(text: str) -> bool:
     t = text.strip()
-    return bool(re.match(r"(?i)^\*?note\b", t)) or t.startswith("注") or t.startswith("说明")
+    return bool(TABLE_NOTE_RE.match(t + " ") or CJK_TABLE_NOTE_RE.match(t))
 
 
-def peek_table_caption(blocks: List[Block]) -> Tuple[str, str]:
-    """Pull optional Table N / italic title from trailing blocks."""
-    number = ""
-    title = ""
-    while blocks and blocks[-1].kind == "blank":
-        blocks.pop()
-    if blocks and blocks[-1].kind == "para":
-        title_candidate = italic_only_text(blocks[-1].segs)
-        raw = blocks[-1].raw.strip()
-        if title_candidate:
-            title = title_candidate
+def split_caption_lines(block: Block) -> Optional[Tuple[str, str]]:
+    """段落若只由「Table N」和/或斜体表题组成，返回 (表号, 表题)；否则 None。"""
+    if block.kind != "para":
+        return None
+    lines = [ln.strip() for ln in block.raw.split("\n") if ln.strip()]
+    number = title = ""
+    if lines and is_table_number_text(lines[0]):
+        number = normalize_table_number(lines.pop(0))
+    if len(lines) == 1:
+        title = italic_only_text(parse_inlines(lines[0])) or ""
+        if title:
+            lines.pop()
+    if lines or not (number or title):
+        return None
+    return number, title
+
+
+def take_table_caption(blocks: List[Block]) -> Tuple[str, str]:
+    """从表格前的段落中取出表号与表题（可在同一段，也可分两段）。"""
+    if not blocks:
+        return "", ""
+    cap = split_caption_lines(blocks[-1])
+    if cap is None:
+        return "", ""
+    blocks.pop()
+    number, title = cap
+    if title and not number and blocks:
+        prev = split_caption_lines(blocks[-1])
+        if prev is not None and prev[0] and not prev[1]:
             blocks.pop()
-            while blocks and blocks[-1].kind == "blank":
-                blocks.pop()
-        elif is_table_number_text(raw):
-            number = normalize_table_number(raw)
-            blocks.pop()
-            return number, title
-    if blocks and blocks[-1].kind == "para" and is_table_number_text(blocks[-1].raw):
-        number = normalize_table_number(blocks[-1].raw)
-        blocks.pop()
+            number = prev[0]
     return number, title
 
 
@@ -249,156 +244,147 @@ def parse_inlines(text: str) -> List[InlineSeg]:
     return segs
 
 
+def inline_source(token) -> str:
+    """inline token 的原始 Markdown，软换行折成空格。"""
+    return re.sub(r"[ \t]*\n[ \t]*", " ", token.content).strip()
+
+
+def cell_align(token) -> Optional[str]:
+    m = re.search(r"text-align:\s*(left|center|right)", str(token.attrGet("style") or ""))
+    return m.group(1) if m else None
+
+
+def parse_table(tokens, i: int) -> Tuple[Block, int]:
+    """从 table_open 开始读到 table_close，返回表格块和下一个 token 下标。"""
+    rows: List[List[str]] = []
+    aligns: List[Optional[str]] = []
+    row: List[str] = []
+    while tokens[i].type != "table_close":
+        tok = tokens[i]
+        if tok.type == "tr_open":
+            row = []
+        elif tok.type in {"th_open", "td_open"}:
+            if not rows:
+                aligns.append(cell_align(tok))
+            row.append(inline_source(tokens[i + 1]) if tokens[i + 1].type == "inline" else "")
+        elif tok.type == "tr_close":
+            rows.append(row)
+        i += 1
+    ncols = max((len(r) for r in rows), default=0)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    aligns += [None] * (ncols - len(aligns))
+    return Block(kind="table", rows=rows, aligns=aligns), i + 1
+
+
 def parse_markdown(body: str) -> List[Block]:
+    md = MarkdownIt("commonmark").enable("table")
+    tokens = md.parse(body)
     blocks: List[Block] = []
-    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # 每层列表：[是否有序, 下一个序号]
+    list_stack: List[List] = []
+    quote_depth = 0
+    quote_parts: List[str] = []
+
     i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        t = tok.type
 
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+        if t == "heading_open":
+            text = inline_source(tokens[i + 1])
+            blocks.append(
+                Block(kind="heading", level=int(tok.tag[1:]), segs=parse_inlines(text), raw=text)
+            )
+            i += 3
+            continue
 
-        if not stripped:
-            blocks.append(Block(kind="blank"))
+        if t in {"bullet_list_open", "ordered_list_open"}:
+            start = int(tok.attrGet("start") or 1)
+            list_stack.append([t == "ordered_list_open", start])
+            i += 1
+            continue
+        if t in {"bullet_list_close", "ordered_list_close"}:
+            list_stack.pop()
+            i += 1
+            continue
+        if t == "list_item_open":
+            ordered, index = list_stack[-1]
+            list_stack[-1][1] += 1
+            # 列表项第一段作为条目文字；同一项里的后续段落按普通段落处理
+            j = i + 1
+            text = ""
+            if tokens[j].type == "paragraph_open":
+                text = inline_source(tokens[j + 1])
+                j += 3
+            blocks.append(
+                Block(
+                    kind="list_item",
+                    level=len(list_stack) - 1,
+                    ordered=ordered,
+                    index=index,
+                    segs=parse_inlines(text),
+                    raw=text,
+                )
+            )
+            i = j
+            continue
+
+        if t == "blockquote_open":
+            quote_depth += 1
+            i += 1
+            continue
+        if t == "blockquote_close":
+            quote_depth -= 1
+            if quote_depth == 0 and quote_parts:
+                text = " ".join(quote_parts)
+                blocks.append(Block(kind="blockquote", segs=parse_inlines(text), raw=text))
+                quote_parts = []
             i += 1
             continue
 
-        if re.match(r"^(-{3,}|\*{3,}|_{3,})\s*$", stripped):
+        if t == "paragraph_open":
+            inline = tokens[i + 1]
+            if quote_depth:
+                quote_parts.append(inline_source(inline))
+            else:
+                raw = inline.content.strip()
+                text = inline_source(inline)
+                blocks.append(Block(kind="para", segs=parse_inlines(text), raw=raw))
+            i += 3
+            continue
+
+        if t in {"fence", "code_block"}:
+            blocks.append(Block(kind="code", raw=tok.content.rstrip("\n")))
+            i += 1
+            continue
+
+        if t == "html_block":
+            text = tok.content.strip()
+            if text:
+                blocks.append(Block(kind="para", segs=[InlineSeg(text)], raw=text))
+            i += 1
+            continue
+
+        if t == "hr":
             blocks.append(Block(kind="hr"))
             i += 1
             continue
 
-        hm = re.match(r"^(#{1,5})\s+(.+)$", stripped)
-        if hm:
-            level = len(hm.group(1))
-            title = hm.group(2).strip()
-            blocks.append(
-                Block(kind="heading", level=level, segs=parse_inlines(title), raw=title)
-            )
-            i += 1
-            continue
-
-        um = re.match(r"^[-*+]\s+(.+)$", stripped)
-        if um:
-            blocks.append(
-                Block(kind="list_item", ordered=False, segs=parse_inlines(um.group(1)))
-            )
-            i += 1
-            continue
-
-        om = re.match(r"^(\d+)[.)]\s+(.+)$", stripped)
-        if om:
-            blocks.append(
-                Block(
-                    kind="list_item",
-                    ordered=True,
-                    index=int(om.group(1)),
-                    segs=parse_inlines(om.group(2)),
-                )
-            )
-            i += 1
-            continue
-
-        if stripped.startswith(">"):
-            quote_lines = []
-            while i < len(lines) and lines[i].strip().startswith(">"):
-                q = re.sub(r"^>\s?", "", lines[i].strip())
-                quote_lines.append(q)
-                i += 1
-            text = " ".join(quote_lines)
-            blocks.append(Block(kind="blockquote", segs=parse_inlines(text), raw=text))
-            continue
-
-        # GFM pipe table: header + separator + body rows
-        if is_pipe_row(stripped) and i + 1 < len(lines) and is_table_separator(
-            lines[i + 1]
-        ):
-            header = split_table_row(lines[i])
-            i += 2
-            rows = [header]
-            while i < len(lines) and is_pipe_row(lines[i]) and not is_table_separator(
-                lines[i]
+        if t == "table_open":
+            table, i = parse_table(tokens, i)
+            table.table_number, table.table_title = take_table_caption(blocks)
+            blocks.append(table)
+            # 紧跟在表格后、以「Note.」/「注：」开头的段落是表注
+            if (
+                i + 2 < len(tokens)
+                and tokens[i].type == "paragraph_open"
+                and is_table_note_text(tokens[i + 1].content)
             ):
-                rows.append(split_table_row(lines[i]))
-                i += 1
-            # Normalize column count
-            ncols = max((len(r) for r in rows), default=0)
-            rows = [r + [""] * (ncols - len(r)) for r in rows]
-
-            number, title = peek_table_caption(blocks)
-            note_segs: List[InlineSeg] = []
-            # Optional note immediately after table (skip one blank)
-            j = i
-            if j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and is_table_note_text(lines[j].strip()):
-                note_text = lines[j].strip()
-                j += 1
-                while j < len(lines) and lines[j].strip() and not is_pipe_row(
-                    lines[j]
-                ) and not re.match(r"^(#{1,5})\s+", lines[j].strip()):
-                    # stop at structural; allow soft-wrapped note lines
-                    if lines[j].strip().startswith(">") or re.match(
-                        r"^[-*+]\s+", lines[j].strip()
-                    ):
-                        break
-                    note_text += " " + lines[j].strip()
-                    j += 1
-                note_segs = parse_inlines(note_text)
-                i = j
-
-            blocks.append(
-                Block(
-                    kind="table",
-                    rows=rows,
-                    table_number=number,
-                    table_title=title,
-                    table_note_segs=note_segs,
-                )
-            )
+                table.table_note_segs = parse_inlines(inline_source(tokens[i + 1]))
+                i += 3
             continue
 
-        # Keep APA table number / italic title as their own blocks (even without blank lines)
-        if is_table_number_text(stripped):
-            blocks.append(
-                Block(kind="para", segs=parse_inlines(stripped), raw=stripped)
-            )
-            i += 1
-            continue
-        if re.match(r"^\*[^*]+\*$", stripped) or re.match(r"^_[^_]+_$", stripped):
-            blocks.append(
-                Block(kind="para", segs=parse_inlines(stripped), raw=stripped)
-            )
-            i += 1
-            continue
-
-        para_parts = [stripped]
         i += 1
-        while i < len(lines):
-            ns = lines[i].strip()
-            if not ns:
-                break
-            if re.match(r"^(#{1,5})\s+", ns):
-                break
-            if re.match(r"^[-*+]\s+", ns):
-                break
-            if re.match(r"^\d+[.)]\s+", ns):
-                break
-            if ns.startswith(">"):
-                break
-            if re.match(r"^(-{3,}|\*{3,}|_{3,})\s*$", ns):
-                break
-            if is_table_number_text(ns):
-                break
-            if re.match(r"^\*[^*]+\*$", ns) or re.match(r"^_[^_]+_$", ns):
-                break
-            # Do not swallow the start of a table into a paragraph
-            if is_pipe_row(ns) and i + 1 < len(lines) and is_table_separator(lines[i + 1]):
-                break
-            para_parts.append(ns)
-            i += 1
-        text = " ".join(para_parts)
-        blocks.append(Block(kind="para", segs=parse_inlines(text), raw=text))
 
     # Auto-number tables that lack an explicit "Table N"
     auto_n = 1
@@ -793,6 +779,9 @@ def write_table(doc: Document, block: Block):
             pf.space_before = Pt(0)
             pf.space_after = Pt(0)
             pf.first_line_indent = Inches(0)
+            align = block.aligns[c_idx] if c_idx < len(block.aligns) else None
+            if align:
+                p.alignment = getattr(WD_ALIGN_PARAGRAPH, align.upper())
             segs = parse_inlines(text)
             if r_idx == 0:
                 # Header row: bold
@@ -811,15 +800,33 @@ def write_table(doc: Document, block: Block):
             p, align=WD_ALIGN_PARAGRAPH.LEFT, first_line_indent=Inches(0)
         )
         note_text = "".join(s.text for s in block.table_note_segs)
-        m = re.match(r"(?i)^(\*?note\.?\*?\s*)(.*)$", note_text)
+        m = re.match(r"(?i)^note\.\s*(.*)$", note_text)
         if m:
-            run = p.add_run("Note. ")
+            run = p.add_run("Note.")
             set_run_font(run, italic=True)
-            rest = m.group(2).lstrip()
+            p.add_run(" ")
+            rest = m.group(1)
             if rest:
                 add_inline_runs(p, parse_inlines(rest))
         else:
             add_inline_runs(p, block.table_note_segs)
+
+
+def write_code_block(doc: Document, block: Block):
+    p = doc.add_paragraph()
+    set_paragraph_format(
+        p, align=WD_ALIGN_PARAGRAPH.LEFT, first_line_indent=Inches(0), left_indent=Inches(0.5)
+    )
+    p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    for n, line in enumerate(block.raw.split("\n")):
+        if n:
+            p.runs[-1].add_break()
+        run = p.add_run(line)
+        set_run_font(run, size=CODE_FONT_SIZE)
+        run.font.name = CODE_FONT_NAME
+        rFonts = run._element.get_or_add_rPr().get_or_add_rFonts()
+        for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+            rFonts.set(qn(attr), CODE_FONT_NAME)
 
 
 def heading_plain_text(block: Block) -> str:
@@ -831,7 +838,7 @@ def find_title_heading(blocks: List[Block], title: Optional[str]) -> Optional[Bl
     if not title:
         return None
     for block in blocks:
-        if block.kind in {"blank", "hr"}:
+        if block.kind == "hr":
             continue
         if (
             block.kind == "heading"
@@ -873,7 +880,7 @@ def write_body(
         set_run_font(run, bold=True)
 
     for block in blocks:
-        if block.kind in {"blank", "hr"}:
+        if block.kind == "hr":
             continue
 
         if block.kind == "heading":
@@ -896,10 +903,12 @@ def write_body(
                 )
             continue
 
-        started = True
-
         if block.kind == "table":
             write_table(doc, block)
+            continue
+
+        if block.kind == "code":
+            write_code_block(doc, block)
             continue
 
         if block.kind == "blockquote":
@@ -944,7 +953,9 @@ def has_title_page_meta(meta: Meta) -> bool:
     return bool(meta.title or meta.author or meta.affiliation or meta.course)
 
 
-def merge_meta(file_meta: Meta, cli_meta: Meta, body: str, fallback_title: str) -> Meta:
+def merge_meta(
+    file_meta: Meta, cli_meta: Meta, blocks: List[Block], fallback_title: str
+) -> Meta:
     meta = Meta(**file_meta.__dict__)
     for key in (
         "title",
@@ -959,11 +970,9 @@ def merge_meta(file_meta: Meta, cli_meta: Meta, body: str, fallback_title: str) 
         if val:
             setattr(meta, key, val)
     if not meta.title:
-        for line in body.splitlines():
-            hm = re.match(r"^#\s+(.+)$", line.strip())
-            if hm:
-                meta.title = hm.group(1).strip()
-                break
+        first_h1 = next((b for b in blocks if b.kind == "heading" and b.level == 1), None)
+        if first_h1 is not None:
+            meta.title = heading_plain_text(first_h1)
     if not meta.title:
         meta.title = fallback_title
     return meta
@@ -972,13 +981,13 @@ def merge_meta(file_meta: Meta, cli_meta: Meta, body: str, fallback_title: str) 
 def convert(md_path: Path, out_path: Path, cli_meta: Meta, *, no_title_page: bool) -> None:
     text = md_path.read_text(encoding="utf-8")
     file_meta, body = parse_front_matter(text)
+    blocks = parse_markdown(body)
     meta = merge_meta(
         file_meta,
         cli_meta,
-        body,
+        blocks,
         fallback_title=md_path.stem.replace("_", " ").replace("-", " "),
     )
-    blocks = parse_markdown(body)
 
     doc = Document()
     setup_document(doc, meta)
@@ -1031,7 +1040,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if Document is None:
-        print("错误: 未安装 python-docx。请在 miscTools 根目录执行: ./install.sh", file=sys.stderr)
+        print(
+            "错误: 缺少 Python 依赖（python-docx、markdown-it-py）。请在 miscTools 根目录执行: ./install.sh",
+            file=sys.stderr,
+        )
         return 1
     md_path = args.input.expanduser().resolve()
     if not md_path.is_file():

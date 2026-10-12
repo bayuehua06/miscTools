@@ -114,6 +114,9 @@ doctor() {
   local docx_ok=false
   "$py" -c "import docx" &>/dev/null && docx_ok=true
   check "python-docx（md2word）" "$docx_ok" "./install.sh"
+  local mdit_ok=false
+  "$py" -c "import markdown_it" &>/dev/null && mdit_ok=true
+  check "markdown-it-py（md2word）" "$mdit_ok" "./install.sh"
 
   echo "电子书工具:"
   local calibre_ok=false
