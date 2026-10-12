@@ -68,9 +68,12 @@ install_system_deps() {
       fi
       local sudo=()
       [[ $(id -u) -ne 0 ]] && sudo=(sudo)
+      # 非交互：遇到被修改过的配置文件时保留本地版本，避免 dpkg 等待输入而失败
+      local apt=("${sudo[@]}" env DEBIAN_FRONTEND=noninteractive apt-get)
       echo "==> 安装系统工具（apt）：calibre djvulibre-bin imagemagick"
-      "${sudo[@]}" apt-get update
-      "${sudo[@]}" apt-get install -y calibre djvulibre-bin imagemagick
+      "${apt[@]}" update
+      "${apt[@]}" install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+        calibre djvulibre-bin imagemagick
       ;;
     *)
       echo "错误: 不支持的系统 $(uname -s)，请手动安装 calibre、djvulibre、imagemagick" >&2
