@@ -56,8 +56,15 @@ try:
     from docx.oxml.ns import qn
     from docx.shared import Inches, Pt
 except ImportError:
-    print("错误: 未安装 python-docx。请在 miscTools 根目录执行: ./install.sh", file=sys.stderr)
-    sys.exit(1)
+    # 推迟到参数解析之后再报错，保证未安装依赖时 --help 仍可用；
+    # Pt/Inches 占位仅供模块级常量与默认参数求值（单位 EMU，与 python-docx 一致）
+    Document = None
+
+    def Pt(points):
+        return int(points * 12700)
+
+    def Inches(inches):
+        return int(inches * 914400)
 
 
 FONT_NAME = "Times New Roman"
@@ -979,6 +986,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if Document is None:
+        print("错误: 未安装 python-docx。请在 miscTools 根目录执行: ./install.sh", file=sys.stderr)
+        return 1
     md_path = args.input.expanduser().resolve()
     if not md_path.is_file():
         print(f"错误: 找不到文件: {md_path}", file=sys.stderr)
