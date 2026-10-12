@@ -170,7 +170,7 @@ print_convert_failure() {
 }
 
 echo "使用: $EBOOK_CONVERT"
-echo "正在将 EPUB 转换为 PDF（A4，边距 ${MARGIN}mm）…"
+echo "正在将 EPUB 转换为 PDF（纸张 ${PAPER_SIZE}，边距 ${MARGIN}mm）…"
 
 set +e
 run_ebook_convert true
