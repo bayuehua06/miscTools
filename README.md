@@ -62,7 +62,9 @@ date: October 12, 2026
 - 开头与论文标题相同的 `#` 视为论文标题；其余章节标题中最浅的一级映射为 APA 一级标题（Word 标题 1），依次类推到 5 级。例如 `#` 写论文标题时，`## Method` 为一级标题
 - 标题为 `References` / `参考文献` 的一节另起一页，条目使用悬挂缩进
 - 中文使用宋体（SimSun），西文使用 Times New Roman
-- GFM 表格前可写 `Table 1` 与斜体表题，表后可写 `*Note.* ...` 表注
+- 按 CommonMark 解析（markdown-it-py）：粗体/斜体可嵌套，支持 `_斜体_` 与 `\*` 转义；代码块以等宽字体原样输出
+- 列表使用 Word 原生项目符号/编号，保留嵌套层级，有序列表按 Markdown 起始序号连续编号
+- GFM 表格（含 `:-:` 等对齐写法，列对齐会保留）前可写 `Table 1` 与斜体表题，表后紧跟以 `*Note.*` 或 `注：` 开头的段落作为表注
 
 完整示例见 [`tools/md2word/examples/apa_sample.md`](tools/md2word/examples/apa_sample.md)。
 

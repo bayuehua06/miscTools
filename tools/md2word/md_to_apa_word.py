@@ -105,6 +105,7 @@ class Block:
     level: int = 0  # heading: 1–6；list_item: 嵌套深度（0 起）
     ordered: bool = False
     index: int = 0
+    list_id: int = 0
     segs: List[InlineSeg] = field(default_factory=list)
     raw: str = ""
     # table fields
@@ -211,37 +212,58 @@ def parse_front_matter(text: str) -> Tuple[Meta, str]:
     return meta, body
 
 
-def parse_inlines(text: str) -> List[InlineSeg]:
-    """Parse **bold**, *italic*, ***both***, `code`, [text](url)."""
+_MD: Optional["MarkdownIt"] = None
+
+
+def markdown_parser() -> "MarkdownIt":
+    global _MD
+    if _MD is None:
+        _MD = MarkdownIt("commonmark").enable("table")
+    return _MD
+
+
+def segs_from_inline_tokens(children) -> List[InlineSeg]:
+    """把 markdown-it 的 inline 子 token 转成带粗/斜体标记的文本段（可任意嵌套）。"""
     segs: List[InlineSeg] = []
-    pattern = re.compile(
-        r"(\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^)]+\))"
-    )
-    pos = 0
-    for m in pattern.finditer(text):
-        if m.start() > pos:
-            segs.append(InlineSeg(text[pos : m.start()]))
-        tok = m.group(0)
-        if tok.startswith("***") and tok.endswith("***"):
-            segs.append(InlineSeg(tok[3:-3], bold=True, italic=True))
-        elif tok.startswith("**") and tok.endswith("**"):
-            segs.append(InlineSeg(tok[2:-2], bold=True))
-        elif tok.startswith("*") and tok.endswith("*"):
-            segs.append(InlineSeg(tok[1:-1], italic=True))
-        elif tok.startswith("`") and tok.endswith("`"):
-            segs.append(InlineSeg(tok[1:-1]))
-        elif tok.startswith("["):
-            link_m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", tok)
-            if link_m:
-                segs.append(InlineSeg(f"{link_m.group(1)} ({link_m.group(2)})"))
-            else:
-                segs.append(InlineSeg(tok))
-        pos = m.end()
-    if pos < len(text):
-        segs.append(InlineSeg(text[pos:]))
-    if not segs:
-        segs.append(InlineSeg(text))
-    return segs
+    bold = italic = 0
+    links: List[Tuple[str, int]] = []  # (href, 链接文字起始段下标)
+
+    def emit(text: str):
+        if text:
+            segs.append(InlineSeg(text, bold=bold > 0, italic=italic > 0))
+
+    for tok in children or []:
+        t = tok.type
+        if t in {"text", "code_inline", "html_inline"}:
+            emit(tok.content)
+        elif t == "softbreak":
+            emit(" ")
+        elif t == "hardbreak":
+            emit("\n")
+        elif t == "strong_open":
+            bold += 1
+        elif t == "strong_close":
+            bold -= 1
+        elif t == "em_open":
+            italic += 1
+        elif t == "em_close":
+            italic -= 1
+        elif t == "link_open":
+            links.append((str(tok.attrGet("href") or ""), len(segs)))
+        elif t == "link_close" and links:
+            href, start = links.pop()
+            label = "".join(s.text for s in segs[start:])
+            if href and href != label and f"mailto:{label}" != href:
+                emit(f" ({href})")
+        elif t == "image":
+            emit(tok.content)
+    return segs or [InlineSeg("")]
+
+
+def parse_inlines(text: str) -> List[InlineSeg]:
+    """CommonMark 行内语法：粗体、斜体（* 与 _，可嵌套）、转义、`code`、链接。"""
+    tokens = markdown_parser().parseInline(text)
+    return segs_from_inline_tokens(tokens[0].children if tokens else [])
 
 
 def inline_source(token) -> str:
@@ -277,13 +299,13 @@ def parse_table(tokens, i: int) -> Tuple[Block, int]:
 
 
 def parse_markdown(body: str) -> List[Block]:
-    md = MarkdownIt("commonmark").enable("table")
-    tokens = md.parse(body)
+    tokens = markdown_parser().parse(body)
     blocks: List[Block] = []
-    # 每层列表：[是否有序, 下一个序号]
+    # 每层列表：[是否有序, 下一个序号, 列表编号]；每个列表（含嵌套子列表）对应一个 Word 编号实例
     list_stack: List[List] = []
+    list_count = 0
     quote_depth = 0
-    quote_parts: List[str] = []
+    quote_parts: List[List[InlineSeg]] = []
 
     i = 0
     while i < len(tokens):
@@ -292,15 +314,15 @@ def parse_markdown(body: str) -> List[Block]:
 
         if t == "heading_open":
             text = inline_source(tokens[i + 1])
-            blocks.append(
-                Block(kind="heading", level=int(tok.tag[1:]), segs=parse_inlines(text), raw=text)
-            )
+            segs = segs_from_inline_tokens(tokens[i + 1].children)
+            blocks.append(Block(kind="heading", level=int(tok.tag[1:]), segs=segs, raw=text))
             i += 3
             continue
 
         if t in {"bullet_list_open", "ordered_list_open"}:
             start = int(tok.attrGet("start") or 1)
-            list_stack.append([t == "ordered_list_open", start])
+            list_count += 1
+            list_stack.append([t == "ordered_list_open", start, list_count])
             i += 1
             continue
         if t in {"bullet_list_close", "ordered_list_close"}:
@@ -308,13 +330,15 @@ def parse_markdown(body: str) -> List[Block]:
             i += 1
             continue
         if t == "list_item_open":
-            ordered, index = list_stack[-1]
+            ordered, index, list_id = list_stack[-1]
             list_stack[-1][1] += 1
             # 列表项第一段作为条目文字；同一项里的后续段落按普通段落处理
             j = i + 1
+            segs = [InlineSeg("")]
             text = ""
             if tokens[j].type == "paragraph_open":
                 text = inline_source(tokens[j + 1])
+                segs = segs_from_inline_tokens(tokens[j + 1].children)
                 j += 3
             blocks.append(
                 Block(
@@ -322,7 +346,8 @@ def parse_markdown(body: str) -> List[Block]:
                     level=len(list_stack) - 1,
                     ordered=ordered,
                     index=index,
-                    segs=parse_inlines(text),
+                    list_id=list_id,
+                    segs=segs,
                     raw=text,
                 )
             )
@@ -336,20 +361,23 @@ def parse_markdown(body: str) -> List[Block]:
         if t == "blockquote_close":
             quote_depth -= 1
             if quote_depth == 0 and quote_parts:
-                text = " ".join(quote_parts)
-                blocks.append(Block(kind="blockquote", segs=parse_inlines(text), raw=text))
+                segs: List[InlineSeg] = []
+                for n, part in enumerate(quote_parts):
+                    if n:
+                        segs.append(InlineSeg(" "))
+                    segs.extend(part)
+                blocks.append(Block(kind="blockquote", segs=segs))
                 quote_parts = []
             i += 1
             continue
 
         if t == "paragraph_open":
             inline = tokens[i + 1]
+            segs = segs_from_inline_tokens(inline.children)
             if quote_depth:
-                quote_parts.append(inline_source(inline))
+                quote_parts.append(segs)
             else:
-                raw = inline.content.strip()
-                text = inline_source(inline)
-                blocks.append(Block(kind="para", segs=parse_inlines(text), raw=raw))
+                blocks.append(Block(kind="para", segs=segs, raw=inline.content.strip()))
             i += 3
             continue
 
@@ -380,7 +408,7 @@ def parse_markdown(body: str) -> List[Block]:
                 and tokens[i].type == "paragraph_open"
                 and is_table_note_text(tokens[i + 1].content)
             ):
-                table.table_note_segs = parse_inlines(inline_source(tokens[i + 1]))
+                table.table_note_segs = segs_from_inline_tokens(tokens[i + 1].children)
                 i += 3
             continue
 
@@ -561,8 +589,106 @@ def setup_document(doc: Document, meta: Meta):
 
 def add_inline_runs(paragraph, segs: List[InlineSeg]):
     for seg in segs:
+        if seg.text == "\n":
+            if paragraph.runs:
+                paragraph.runs[-1].add_break()
+            continue
         run = paragraph.add_run(seg.text)
         set_run_font(run, bold=seg.bold, italic=seg.italic)
+
+
+BULLET_CHARS = ["•", "◦", "▪"]
+NUMBER_FORMATS = ["decimal", "lowerLetter", "lowerRoman"]
+LIST_INDENT_TWIPS = 720  # 0.5"
+LIST_HANGING_TWIPS = 360  # 0.25"
+
+
+class ListNumbering:
+    """为 Word 原生列表维护 numbering.xml：一个项目符号、一个编号的 abstractNum，
+    每个 Markdown 列表（含嵌套子列表）各建一个 w:num，以便独立起始编号。"""
+
+    def __init__(self, doc: Document):
+        self.numbering = doc.part.numbering_part.element
+        self.abstract_ids = {}
+        self.num_ids = {}
+
+    def _next_id(self, tag: str, attr: str) -> int:
+        ids = [int(el.get(qn(attr))) for el in self.numbering.findall(qn(tag))]
+        return max(ids, default=0) + 1
+
+    def _abstract_id(self, ordered: bool) -> int:
+        if ordered in self.abstract_ids:
+            return self.abstract_ids[ordered]
+        aid = self._next_id("w:abstractNum", "w:abstractNumId")
+        absn = OxmlElement("w:abstractNum")
+        absn.set(qn("w:abstractNumId"), str(aid))
+        mlt = OxmlElement("w:multiLevelType")
+        mlt.set(qn("w:val"), "multilevel" if ordered else "hybridMultilevel")
+        absn.append(mlt)
+        for lvl in range(9):
+            el = OxmlElement("w:lvl")
+            el.set(qn("w:ilvl"), str(lvl))
+            fmt = NUMBER_FORMATS[lvl % 3] if ordered else "bullet"
+            text = f"%{lvl + 1}." if ordered else BULLET_CHARS[lvl % 3]
+            for tag, val in (
+                ("w:start", "1"),
+                ("w:numFmt", fmt),
+                ("w:lvlText", text),
+                ("w:lvlJc", "left"),
+            ):
+                child = OxmlElement(tag)
+                child.set(qn("w:val"), val)
+                el.append(child)
+            ppr = OxmlElement("w:pPr")
+            ind = OxmlElement("w:ind")
+            ind.set(qn("w:left"), str(LIST_INDENT_TWIPS * (lvl + 1)))
+            ind.set(qn("w:hanging"), str(LIST_HANGING_TWIPS))
+            ppr.append(ind)
+            el.append(ppr)
+            rpr = OxmlElement("w:rPr")
+            fonts = OxmlElement("w:rFonts")
+            for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+                fonts.set(qn(attr), FONT_NAME)
+            rpr.append(fonts)
+            el.append(rpr)
+            absn.append(el)
+        # 规范要求所有 abstractNum 位于 num 之前
+        first_num = self.numbering.find(qn("w:num"))
+        if first_num is not None:
+            first_num.addprevious(absn)
+        else:
+            self.numbering.append(absn)
+        self.abstract_ids[ordered] = aid
+        return aid
+
+    def num_id(self, block: Block) -> int:
+        if block.list_id in self.num_ids:
+            return self.num_ids[block.list_id]
+        aid = self._abstract_id(block.ordered)
+        nid = self._next_id("w:num", "w:numId")
+        num = OxmlElement("w:num")
+        num.set(qn("w:numId"), str(nid))
+        ref = OxmlElement("w:abstractNumId")
+        ref.set(qn("w:val"), str(aid))
+        num.append(ref)
+        override = OxmlElement("w:lvlOverride")
+        override.set(qn("w:ilvl"), str(min(block.level, 8)))
+        start = OxmlElement("w:startOverride")
+        start.set(qn("w:val"), str(block.index if block.ordered else 1))
+        override.append(start)
+        num.append(override)
+        self.numbering.append(num)
+        self.num_ids[block.list_id] = nid
+        return nid
+
+
+def write_list_item(doc: Document, numbering: ListNumbering, block: Block):
+    p = doc.add_paragraph()
+    set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.LEFT)
+    num_pr = p._p.get_or_add_pPr().get_or_add_numPr()
+    num_pr.get_or_add_ilvl().val = min(block.level, 8)
+    num_pr.get_or_add_numId().val = numbering.num_id(block)
+    add_inline_runs(p, block.segs)
 
 
 def write_title_page(doc: Document, meta: Meta):
@@ -858,6 +984,7 @@ def write_body(
     repeat_title: bool = False,
 ):
     in_references = False
+    numbering = ListNumbering(doc)
     title_block = find_title_heading(blocks, title)
 
     # 论文标题占用了 #，其余章节标题整体上移，使最浅的一级对应 APA 一级标题
@@ -923,17 +1050,7 @@ def write_body(
             continue
 
         if block.kind == "list_item":
-            p = doc.add_paragraph()
-            set_paragraph_format(
-                p,
-                align=WD_ALIGN_PARAGRAPH.LEFT,
-                left_indent=Inches(0.5),
-                first_line_indent=Inches(0),
-            )
-            prefix = f"{block.index}. " if block.ordered else "• "
-            run = p.add_run(prefix)
-            set_run_font(run)
-            add_inline_runs(p, block.segs)
+            write_list_item(doc, numbering, block)
             continue
 
         if block.kind == "para":
