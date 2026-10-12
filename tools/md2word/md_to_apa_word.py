@@ -805,10 +805,19 @@ def write_table(doc: Document, block: Block):
 
 
 def write_body(
-    doc: Document, blocks: List[Block], *, skip_duplicate_title: Optional[str] = None
+    doc: Document, blocks: List[Block], *, body_title: Optional[str] = None
 ):
     in_references = False
     started = False
+
+    # APA 7：标题页之后，正文第一页顶端重复论文标题（居中加粗）
+    if body_title:
+        p = doc.add_paragraph(style="Heading 1")
+        set_paragraph_format(
+            p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0)
+        )
+        run = p.add_run(body_title)
+        set_run_font(run, bold=True)
 
     for block in blocks:
         if block.kind in {"blank", "hr"}:
@@ -818,9 +827,9 @@ def write_body(
             heading_text = "".join(s.text for s in block.segs).strip()
             if (
                 not started
-                and skip_duplicate_title
+                and body_title
                 and block.level == 1
-                and heading_text.lower() == skip_duplicate_title.lower()
+                and heading_text.lower() == body_title.lower()
             ):
                 continue
             started = True
@@ -927,7 +936,7 @@ def convert(md_path: Path, out_path: Path, cli_meta: Meta, *, no_title_page: boo
         write_body(doc, blocks)
     elif has_title_page_meta(meta):
         write_title_page(doc, meta)
-        write_body(doc, blocks, skip_duplicate_title=meta.title)
+        write_body(doc, blocks, body_title=meta.title)
     else:
         write_body(doc, blocks)
 
