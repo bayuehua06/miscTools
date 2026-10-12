@@ -1,3 +1,6 @@
 # md2word（Markdown → APA Word）
 python-docx>=1.1,<2
 markdown-it-py>=3,<5
+
+# pdf2md（PDF → Markdown）；AGPL-3.0，另有 Artifex 商业授权
+PyMuPDF>=1.24,<2
