@@ -59,8 +59,9 @@ date: October 12, 2026
 ---
 ```
 
-- `#`–`#####` 映射为 Word 标题 1–5
-- 标题为 `References` / `参考文献` 的一节使用悬挂缩进
+- 开头与论文标题相同的 `#` 视为论文标题；其余章节标题中最浅的一级映射为 APA 一级标题（Word 标题 1），依次类推到 5 级。例如 `#` 写论文标题时，`## Method` 为一级标题
+- 标题为 `References` / `参考文献` 的一节另起一页，条目使用悬挂缩进
+- 中文使用宋体（SimSun），西文使用 Times New Roman
 - GFM 表格前可写 `Table 1` 与斜体表题，表后可写 `*Note.* ...` 表注
 
 完整示例见 [`tools/md2word/examples/apa_sample.md`](tools/md2word/examples/apa_sample.md)。

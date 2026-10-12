@@ -23,8 +23,10 @@ APA 约定（学生论文）:
   - Times New Roman 12pt、全文双倍行距
   - 标题页（有元数据时）
   - 正文首行缩进 0.5"
-  - Markdown #–##### → Word Heading 1–5（导航窗格可用），外观按 APA
-  - 「References」节悬挂缩进
+  - 章节标题 → Word Heading 1–5（导航窗格可用），外观按 APA；
+    # 用作论文标题时，## 对应一级标题
+  - 「References」节另起一页、悬挂缩进
+  - 西文 Times New Roman，中文宋体
   - GFM 表格：表号（粗体）+ 斜体表题 + 仅顶线/表头下线/底线（无竖线）
 
 表格 Markdown 示例:
@@ -44,13 +46,13 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 try:
     from docx import Document
-    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT
     from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
@@ -68,6 +70,8 @@ except ImportError:
 
 
 FONT_NAME = "Times New Roman"
+# Times New Roman 没有中文字形；中文单独指定，避免 Word 随机回退
+EAST_ASIA_FONT = "SimSun"
 FONT_SIZE = Pt(12)
 MARGIN = Inches(1)
 FIRST_LINE_INDENT = Inches(0.5)
@@ -417,7 +421,7 @@ def _set_style_east_asia_font(style) -> None:
         rFonts = rPr.get_or_add_rFonts()
         rFonts.set(qn("w:ascii"), FONT_NAME)
         rFonts.set(qn("w:hAnsi"), FONT_NAME)
-        rFonts.set(qn("w:eastAsia"), FONT_NAME)
+        rFonts.set(qn("w:eastAsia"), EAST_ASIA_FONT)
         rFonts.set(qn("w:cs"), FONT_NAME)
     except Exception:
         pass
@@ -432,7 +436,7 @@ def set_run_font(run, *, bold=False, italic=False, size=FONT_SIZE):
     rFonts = rPr.get_or_add_rFonts()
     rFonts.set(qn("w:ascii"), FONT_NAME)
     rFonts.set(qn("w:hAnsi"), FONT_NAME)
-    rFonts.set(qn("w:eastAsia"), FONT_NAME)
+    rFonts.set(qn("w:eastAsia"), EAST_ASIA_FONT)
     rFonts.set(qn("w:cs"), FONT_NAME)
 
 
@@ -546,6 +550,13 @@ def setup_document(doc: Document, meta: Meta):
         run = hp.add_run(meta.running_head.upper()[:50])
         set_run_font(run)
         hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        # 默认 Header 样式在 3.25" 有居中制表位，会截住第一个 \t；清掉后在版心右缘放右对齐制表位
+        tabs = hp.paragraph_format.tab_stops
+        tabs.add_tab_stop(Inches(3.25), WD_TAB_ALIGNMENT.CLEAR)
+        tabs.add_tab_stop(
+            section.page_width - section.left_margin - section.right_margin,
+            WD_TAB_ALIGNMENT.RIGHT,
+        )
         tab = hp.add_run("\t")
         set_run_font(tab)
     add_page_number(hp)
@@ -811,19 +822,54 @@ def write_table(doc: Document, block: Block):
             add_inline_runs(p, block.table_note_segs)
 
 
+def heading_plain_text(block: Block) -> str:
+    return "".join(s.text for s in block.segs).strip()
+
+
+def find_title_heading(blocks: List[Block], title: Optional[str]) -> Optional[Block]:
+    """正文开头与论文标题相同的 # 标题（出现在任何正文内容之前）。"""
+    if not title:
+        return None
+    for block in blocks:
+        if block.kind in {"blank", "hr"}:
+            continue
+        if (
+            block.kind == "heading"
+            and block.level == 1
+            and heading_plain_text(block).lower() == title.lower()
+        ):
+            return block
+        return None
+    return None
+
+
 def write_body(
-    doc: Document, blocks: List[Block], *, body_title: Optional[str] = None
+    doc: Document,
+    blocks: List[Block],
+    *,
+    title: Optional[str] = None,
+    repeat_title: bool = False,
 ):
     in_references = False
-    started = False
+    title_block = find_title_heading(blocks, title)
+
+    # 论文标题占用了 #，其余章节标题整体上移，使最浅的一级对应 APA 一级标题
+    section_levels = [
+        b.level
+        for b in blocks
+        if b.kind == "heading"
+        and b is not title_block
+        and not is_references_heading(heading_plain_text(b))
+    ]
+    level_offset = min(section_levels) - 1 if section_levels else 0
 
     # APA 7：标题页之后，正文第一页顶端重复论文标题（居中加粗）
-    if body_title:
+    if repeat_title and title:
         p = doc.add_paragraph(style="Heading 1")
         set_paragraph_format(
             p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0)
         )
-        run = p.add_run(body_title)
+        run = p.add_run(title)
         set_run_font(run, bold=True)
 
     for block in blocks:
@@ -831,25 +877,23 @@ def write_body(
             continue
 
         if block.kind == "heading":
-            heading_text = "".join(s.text for s in block.segs).strip()
-            if (
-                not started
-                and body_title
-                and block.level == 1
-                and heading_text.lower() == body_title.lower()
-            ):
+            if block is title_block:
+                if not repeat_title:
+                    write_heading(doc, block)
                 continue
-            started = True
-            in_references = is_references_heading(heading_text)
+            in_references = is_references_heading(heading_plain_text(block))
             if in_references:
                 p = doc.add_paragraph(style="Heading 1")
                 set_paragraph_format(
                     p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0)
                 )
+                p.paragraph_format.page_break_before = True
                 run = p.add_run("References")
                 set_run_font(run, bold=True)
             else:
-                write_heading(doc, block)
+                write_heading(
+                    doc, replace(block, level=max(1, block.level - level_offset))
+                )
             continue
 
         started = True
@@ -940,12 +984,12 @@ def convert(md_path: Path, out_path: Path, cli_meta: Meta, *, no_title_page: boo
     setup_document(doc, meta)
 
     if no_title_page:
-        write_body(doc, blocks)
+        write_body(doc, blocks, title=meta.title)
     elif has_title_page_meta(meta):
         write_title_page(doc, meta)
-        write_body(doc, blocks, body_title=meta.title)
+        write_body(doc, blocks, title=meta.title, repeat_title=True)
     else:
-        write_body(doc, blocks)
+        write_body(doc, blocks, title=meta.title)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(out_path))
