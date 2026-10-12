@@ -14,9 +14,9 @@
   2. 选择章节结构来源（--structure auto 时按可靠程度自动选择）:
        outline   PDF 书签（原生 PDF 通常可靠）
        contents  书前印刷目录（老书扫描件：CHAPTER + 标题 + 小节列表 + 页码）
-       fonts     字号/粗体（原生 PDF 无书签时）
-       pattern   正文中的「CHAPTER I」等文字规律（兜底）
-  3. 去页眉页脚、页码、印张标记、插图页与图注；重建段落、合并断词；OCR 文字做常见纠错
+       fonts     字号 / 粗体 / 斜体 / 居中（原生 PDF 无书签时；ocrmypdf 的 OCR 结果也可用，Google Books 不用）
+       pattern   正文中的「CHAPTER I」「PART II」章首标记（兜底）
+  3. 去页眉页脚、页码、印张标记、插图页与图注；重建段落、合并断词；脚注转为 Markdown 脚注；OCR 文字做常见纠错
   4. 标题最多 4 级（# 至 ####）
 """
 
@@ -65,6 +65,8 @@ class Line:
     y1: float
     size: float = 0.0
     bold: bool = False
+    italic: bool = False
+    centered: bool = False
 
     @property
     def height(self) -> float:
@@ -206,6 +208,11 @@ def span_is_bold(span: dict) -> bool:
     return bool(span["flags"] & 16) or "bold" in span["font"].lower()
 
 
+def span_is_italic(span: dict) -> bool:
+    font = span["font"].lower()
+    return bool(span["flags"] & 2) or "italic" in font or "oblique" in font
+
+
 def join_spans(spans: List[dict]) -> Line:
     spans = sorted(spans, key=lambda s: s["bbox"][0])
     text = ""
@@ -229,6 +236,7 @@ def join_spans(spans: List[dict]) -> Line:
         y1=max(s["bbox"][3] for s in spans),
         size=chars.most_common(1)[0][0],
         bold=all(span_is_bold(s) for s in spans),
+        italic=all(span_is_italic(s) for s in spans),
     )
 
 
@@ -262,6 +270,17 @@ def lines_by_pdf_order(page_dict) -> List[Line]:
     return out
 
 
+def mark_centered(lines: List[Line], page_width: float) -> None:
+    """相对本页正文块（而非纸张，书页左右边距常不对称）判断是否居中。"""
+    if len(lines) < 3:
+        return
+    left = sorted(l.x0 for l in lines)[len(lines) // 10]
+    right = sorted(l.x1 for l in lines)[(len(lines) * 9) // 10]
+    tol = 0.04 * page_width
+    for l in lines:
+        l.centered = l.x0 - left > tol and abs((l.x0 - left) - (right - l.x1)) < tol
+
+
 def extract_pages(doc, kind: str) -> List[Page]:
     pages = []
     for page in doc:
@@ -271,6 +290,7 @@ def extract_pages(doc, kind: str) -> List[Page]:
             lines = lines_by_pdf_order(d)
         else:
             lines = lines_by_geometry(list(spans_of(d)))
+        mark_centered(lines, page.rect.width)
         area = page.rect.width * page.rect.height
         figures = []
         for info in page.get_image_info():
@@ -378,7 +398,7 @@ def run_ocr(src: Path, lang: str, force: bool) -> Path:
         raise SystemExit("错误: 需要 ocrmypdf 才能处理扫描件。请运行 ./install.sh --system")
     out = Path(tempfile.mkdtemp(prefix="pdf2md.")) / "ocr.pdf"
     cmd = ["ocrmypdf", "--force-ocr" if force else "--skip-text", "-l", lang, str(src), str(out)]
-    print(f"正在 OCR（{' '.join(cmd[1:3])}，语言 {lang}）…", file=sys.stderr)
+    print(f"正在 OCR（ocrmypdf {cmd[1]}，语言 {lang}）…", file=sys.stderr)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         sys.stderr.write(result.stderr[-2000:])
@@ -663,6 +683,27 @@ def locate_chapters(pages: List[Page], entries: List[Heading], after: int) -> No
     entries.sort(key=lambda e: (e.page is None, e.page or 0))
 
 
+def pattern_headings(pages: List[Page]) -> List[Heading]:
+    """没有书签也没有书前目录时：页面上半部出现 CHAPTER / PART 标记的页即章首页。
+    章号、标题、副标题留给 strip_chapter_lines 从正文补齐。"""
+    skip = set(find_contents_pages(pages))
+    found: List[Tuple[int, str]] = []
+    for p in pages:
+        if p.index in skip:
+            continue
+        has_marker, _ = marker_numeral(p)
+        if not has_marker:
+            continue
+        word = next(
+            CHAPTER_MARKER_RE.match(l.text.translate(HOMOGLYPHS).strip()).group(1).lower()
+            for l in sorted(p.lines, key=lambda l: l.cy)
+            if chapter_marker(l)
+        )
+        found.append((p.index, word))
+    has_parts = any(w == "part" for _, w in found) and any(w == "chapter" for _, w in found)
+    return [Heading(level=2 if has_parts and w == "chapter" else 1, title="", page=i) for i, w in found]
+
+
 def strip_chapter_lines(lines: List[Line], heading: Heading) -> Tuple[List[Line], Optional[str], Optional[str]]:
     """去掉章首页顶部的「CHAPTER / I / (To 1510) / 标题」，返回正文行与正文中的标题、副标题写法。
 
@@ -692,6 +733,8 @@ def strip_chapter_lines(lines: List[Line], heading: Heading) -> Tuple[List[Line]
             continue
         if not heading.title and len(t) < 80 and not t.endswith((".", ",", ";")):
             heading.title = clean_ocr_text(t)
+            if is_mostly_upper(heading.title):
+                heading.title = title_case(heading.title)
             body_title = heading.title
             i += 1
             continue
@@ -714,27 +757,75 @@ def outline_headings(doc) -> List[Heading]:
     return out
 
 
-def font_levels(pages: List[Page]) -> Dict[float, int]:
-    sizes: Counter = Counter()
-    for p in pages:
-        for l in p.lines:
-            sizes[l.size] += len(l.text)
-    if not sizes:
-        return {}
-    body = sizes.most_common(1)[0][0]
-    candidates = sorted({s for s in sizes if s >= body * 1.12 and s - body >= 1.0}, reverse=True)
-    return {s: min(i + 1, MAX_LEVEL) for i, s in enumerate(candidates[:MAX_LEVEL])}
+StyleKey = Tuple[float, bool, bool, bool]
 
 
-def is_font_heading(line: Line, levels: Dict[float, int], body_size: float) -> Optional[int]:
+def heading_candidate(line: Line) -> bool:
     t = line.text.strip()
-    if len(t) > 120 or not re.search(r"[A-Za-z\u4e00-\u9fff]", t):
+    return len(t) < 100 and bool(re.search(r"[A-Za-z\u4e00-\u9fff]", t)) and not t.endswith((".", ",", ";", ":"))
+
+
+class FontLevels:
+    """标题样式 → 级别。
+
+    原生 PDF：样式 = 字号 + 粗体 + 斜体 + 居中，比正文大或与正文同号但加粗才算候选。
+    OCR（ocrmypdf / tesseract）：只有字号（由行高推算）可信且有抖动，按比例聚类，并要求明显大于正文。
+    """
+
+    # tesseract 推算的同一样式字号会抖动约 ±10%，正文行最高约到 1.08 倍
+    OCR_MIN_RATIO = 1.18
+    OCR_CLUSTER_RATIO = 1.12
+
+    def __init__(self, pages: List[Page], ocr: bool = False):
+        self.ocr = ocr
+        self.clusters: List[float] = []
+        self.levels: Dict[StyleKey, int] = {}
+        sizes: Counter = Counter()
+        for p in pages:
+            for l in p.lines:
+                sizes[round(l.size * 2) / 2] += len(l.text)
+        if not sizes:
+            self.body = 0.0
+            return
+        self.body = sizes.most_common(1)[0][0]
+        total = sum(sizes.values())
+        candidates = [l for p in pages for l in p.lines if heading_candidate(l)]
+        if ocr:
+            for s in sorted({l.size for l in candidates if l.size >= self.OCR_MIN_RATIO * self.body}, reverse=True):
+                if not self.clusters or self.clusters[-1] / s > self.OCR_CLUSTER_RATIO:
+                    self.clusters.append(s)
+        styles: Counter = Counter()
+        for l in candidates:
+            key = self.key(l)
+            if key:
+                styles[key] += len(l.text)
+        # 大量出现的样式是正文的一部分（如整段粗体的引文），不是标题
+        keys = [k for k, chars in styles.items() if chars < 0.15 * total]
+        # 字号大者在上；同号时 粗体 > 居中 > 非斜体
+        keys.sort(key=lambda k: (-k[0], not k[1], not k[3], k[2]))
+        self.levels = {k: min(i + 1, MAX_LEVEL) for i, k in enumerate(keys)}
+
+    def __len__(self) -> int:
+        return len(self.levels)
+
+    def key(self, line: Line) -> Optional[StyleKey]:
+        if self.ocr:
+            if not self.clusters or line.size < self.OCR_MIN_RATIO * self.body:
+                return None
+            rep = min(self.clusters, key=lambda c: abs(c - line.size))
+            return (rep, False, False, line.centered)
+        size = round(line.size * 2) / 2
+        if line.size - self.body >= 1.0:
+            return (size, line.bold, line.italic, line.centered)
+        if abs(line.size - self.body) < 0.6 and line.bold:
+            return (size, True, line.italic, line.centered)
         return None
-    if line.size in levels:
-        return levels[line.size]
-    if line.bold and abs(line.size - body_size) < 0.6 and len(t) < 80 and not t.endswith((".", ",", ";")):
-        return min(len(levels) + 1, MAX_LEVEL)
-    return None
+
+    def level(self, line: Line) -> Optional[int]:
+        if not heading_candidate(line):
+            return None
+        key = self.key(line)
+        return self.levels.get(key) if key else None
 
 
 # ---------------------------------------------------------------- 正文流
@@ -884,7 +975,6 @@ def render(items: List[Item], counts: Counter, ocr: bool, meta: Dict[str, str]) 
         return text, defs
 
     def place_note(raw: str) -> None:
-        nonlocal note_count
         marker = raw.split(None, 1)[0]
         ref = footnote_ref(marker)
         if not any(ref.search(p) for p in para):
@@ -970,7 +1060,9 @@ def choose_structure(analysis: Analysis, doc, pages: List[Page], requested: str)
     order = [requested] if requested != "auto" else (
         ["outline", "contents", "fonts", "pattern"]
         if analysis.kind == "digital"
-        else ["contents", "pattern"]
+        # Google Books 的 OCR 层字号与版面无关；ocrmypdf 的字号按行高推算，还能用
+        else ["contents", "pattern"] if analysis.google_books
+        else ["contents", "fonts", "pattern"]
     )
     for strategy in order:
         if strategy == "outline":
@@ -990,13 +1082,28 @@ def choose_structure(analysis: Analysis, doc, pages: List[Page], requested: str)
                 return "contents", hs, f"书前目录（{where}；{len(hs)} 章，{topics} 个小节条目）"
             tried.append("未找到可解析的书前目录")
         elif strategy == "fonts":
-            levels = font_levels(pages)
+            levels = FontLevels(pages, ocr=analysis.kind != "digital")
             if levels or requested == "fonts":
-                return "fonts", [], f"字号（{len(levels)} 种标题字号）"
-            tried.append("没有明显大于正文的字号")
+                return "fonts", [], f"字号与字形（{len(levels)} 种标题样式）"
+            tried.append("没有区别于正文的标题样式")
         elif strategy == "pattern":
-            return "pattern", [], "正文中的 CHAPTER 等文字规律"
+            hs = pattern_headings(pages)
+            if hs or requested == "pattern":
+                return "pattern", hs, f"正文中的 CHAPTER / PART 标记（{len(hs)} 章）"
+            tried.append("正文中没有 CHAPTER / PART 标记")
     raise SystemExit("错误: 无法确定章节结构（" + "；".join(tried) + "）")
+
+
+JUNK_META_RE = re.compile(
+    r"(?i)^(untitled|unknown|user|admin(istrator)?|owner|author|python-docx|microsoft (office )?(word|user)"
+    r"|.*\.(docx?|pdf|indd|tex|rtf|odt|qxd))$"
+)
+
+
+def useful_meta(value: str) -> str:
+    """丢弃生成工具写入的无意义元数据（作者 python-docx、标题为文件名等）。"""
+    value = (value or "").strip()
+    return "" if not value or JUNK_META_RE.match(value) else value
 
 
 def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
@@ -1034,18 +1141,13 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
     for h in headings:
         by_page.setdefault(h.page, []).append(h)
 
-    if strategy == "contents" and headings:
+    if strategy in {"contents", "pattern"} and headings:
         start = min(h.page for h in headings)
         end = find_back_matter(pages, max(h.page for h in headings))
     else:
         start, end = 0, len(pages)
 
-    font_map = font_levels(pages) if strategy == "fonts" else {}
-    body_size = Counter({l.size: 0 for p in pages for l in p.lines})
-    for p in pages:
-        for l in p.lines:
-            body_size[l.size] += len(l.text)
-    body_size_value = body_size.most_common(1)[0][0] if body_size else 0.0
+    font_levels = FontLevels(pages, ocr=ocr) if strategy == "fonts" else None
 
     dense = [p for p in pages if len(p.lines) >= 15]
     doc_pitch = median(line_pitch(sorted(p.lines, key=lambda l: l.cy)) for p in dense) if dense else None
@@ -1056,7 +1158,8 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
     dropped = 0
     for page in pages[start:end]:
         lines = strip_header_footer(page, doc_pitch)
-        lines = drop_figure_text(page, lines, body_height)
+        if ocr:
+            lines = drop_figure_text(page, lines, body_height)
         if repeated:
             lines = [l for l in lines if re.sub(r"\d+", "#", norm(l.text)) not in repeated]
         if ocr and is_garbage_page(lines, counts):
@@ -1064,7 +1167,7 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
             continue
         lines, notes = split_footnotes(page, lines, body_height, doc_pitch or line_pitch(lines))
         for h in by_page.get(page.index, []):
-            if strategy == "contents":
+            if strategy in {"contents", "pattern"}:
                 lines, body_title, body_sub = strip_chapter_lines(lines, h)
                 if body_title and similar(body_title, h.title) > 0.6:
                     h.title = body_title
@@ -1073,8 +1176,8 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
                 builder.heading(h)
             elif strategy == "outline":
                 lines = place_outline_heading(builder, lines, h)
-        if strategy in {"fonts", "pattern"}:
-            emit_detected_headings(builder, lines, strategy, font_map, body_size_value)
+        if strategy == "fonts":
+            emit_font_headings(builder, lines, font_levels)
         else:
             builder.page_lines(lines, gap_breaks=not ocr)
         for note in notes:
@@ -1082,7 +1185,7 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
     if dropped:
         print(f"  跳过插图/乱码页 {dropped} 页", file=sys.stderr)
 
-    meta = {"title": (doc.metadata or {}).get("title", ""), "author": (doc.metadata or {}).get("author", "")}
+    meta = {k: useful_meta((doc.metadata or {}).get(k, "")) for k in ("title", "author")}
     md = render(builder.items, counts, ocr, meta)
     out_path = out_path or pdf_path.with_suffix(".md")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1110,46 +1213,29 @@ def place_outline_heading(builder: Builder, lines: List[Line], h: Heading) -> Li
     return lines
 
 
-def emit_detected_headings(builder: Builder, lines: List[Line], strategy: str, font_map, body_size) -> None:
+def emit_font_headings(builder: Builder, lines: List[Line], font_levels: FontLevels) -> None:
+    """按标题样式切分本页：连续同样式的行合并为一个（跨行的）标题。"""
+    gap_breaks = not builder.ocr
     chunk: List[Line] = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        level = None
-        title = line.text.strip()
-        consumed = 1
-        if strategy == "fonts":
-            level = is_font_heading(line, font_map, body_size)
-            while level is not None and i + consumed < len(lines):
-                nxt = lines[i + consumed]
-                if is_font_heading(nxt, font_map, body_size) == level and nxt.size == line.size:
-                    title += " " + nxt.text.strip()
-                    consumed += 1
-                else:
-                    break
-        elif chapter_marker(line) and line.cy < 0.5 * 10_000:
-            level = 1
-            m = re.match(r"^(\S+)\s+(" + ROMAN_RE + r"|\d+)\b\.?\s*(.*)$", title.translate(HOMOGLYPHS))
-            label = f"{m.group(1).title()} {m.group(2)}" if m else title
-            rest = m.group(3) if m else ""
-            j = i + 1
-            if not rest and j < len(lines) and re.fullmatch(ROMAN_RE + r"\.?|\d+", lines[j].text.strip()):
-                label += " " + lines[j].text.strip(" .")
-                j += 1
-            if not rest and j < len(lines) and len(lines[j].text) < 80 and not lines[j].text.rstrip().endswith((".", ",")):
-                rest = lines[j].text.strip()
-                j += 1
-            title = f"{label}: {clean_ocr_text(rest)}" if rest else label
-            consumed = j - i
-        if level is not None:
-            builder.page_lines(chunk, gap_breaks=strategy == "fonts")
-            chunk = []
-            builder.heading(Heading(level=level, title=title))
-            i += consumed
+        level = font_levels.level(line)
+        if level is None:
+            chunk.append(line)
+            i += 1
             continue
-        chunk.append(line)
+        title = line.text.strip()
         i += 1
-    builder.page_lines(chunk, gap_breaks=strategy == "fonts")
+        while i < len(lines) and font_levels.level(lines[i]) == level and font_levels.key(lines[i]) == font_levels.key(line):
+            title += " " + lines[i].text.strip()
+            i += 1
+        builder.page_lines(chunk, gap_breaks=gap_breaks)
+        chunk = []
+        if builder.ocr:
+            title = clean_ocr_text(title)
+        builder.heading(Heading(level=level, title=title))
+    builder.page_lines(chunk, gap_breaks=gap_breaks)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
