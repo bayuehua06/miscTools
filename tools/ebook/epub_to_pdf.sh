@@ -117,6 +117,12 @@ fi
 
 PAPER_SIZE=${EPUB_PDF_PAPER_SIZE:-a4}
 MARGIN=${EPUB_PDF_MARGIN:-12}
+if [[ ! "$MARGIN" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "错误: EPUB_PDF_MARGIN 应为非负数（毫米），当前为「$MARGIN」" >&2
+  exit 1
+fi
+# ebook-convert 的 --pdf-page-margin-* 单位是 pt
+MARGIN_PT=$(awk -v mm="$MARGIN" 'BEGIN { printf "%.2f", mm * 72 / 25.4 }')
 
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/epub2pdf.XXXXXX")
 cleanup() {
@@ -130,10 +136,10 @@ run_ebook_convert() {
   local -a cmd=(
     "$EBOOK_CONVERT" "$INPUT" "$OUTPUT"
     --paper-size "$PAPER_SIZE"
-    --pdf-page-margin-left "$MARGIN"
-    --pdf-page-margin-right "$MARGIN"
-    --pdf-page-margin-top "$MARGIN"
-    --pdf-page-margin-bottom "$MARGIN"
+    --pdf-page-margin-left "$MARGIN_PT"
+    --pdf-page-margin-right "$MARGIN_PT"
+    --pdf-page-margin-top "$MARGIN_PT"
+    --pdf-page-margin-bottom "$MARGIN_PT"
   )
   if [[ "$embed_fonts" == true ]]; then
     cmd+=(--embed-all-fonts)
