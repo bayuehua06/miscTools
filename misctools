@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# miscTools 总入口：misctools <命令> [参数...]
+# 运行 `misctools help` 查看全部命令。
+
+set -euo pipefail
+
+resolve_root() {
+  local src=${BASH_SOURCE[0]}
+  while [[ -L "$src" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname -- "$src")" && pwd)"
+    src="$(readlink -- "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname -- "$src")" && pwd
+}
+
+ROOT="$(resolve_root)"
+EBOOK_DIR="$ROOT/tools/ebook"
+MD2WORD_DIR="$ROOT/tools/md2word"
+
+python_bin() {
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    echo "$ROOT/.venv/bin/python"
+  else
+    echo python3
+  fi
+}
+
+usage() {
+  cat <<EOF
+用法: $(basename "$0") <命令> [参数...]
+
+电子书 → PDF
+  book2pdf  <输入.djvu|输入.epub> [输出.pdf]   按扩展名自动选择转换方式
+  epub2pdf  <输入.epub> [输出.pdf]             Calibre 渲染
+  djvu2pdf  <输入.djvu> [输出.pdf]             DjVuLibre + ImageMagick
+
+Markdown → Word
+  md2word   <输入.md> [-o 输出.docx] [选项]    APA 7th 学生论文版式（选项见 md2word --help）
+
+其他
+  doctor                                     检查依赖是否就绪
+  help [命令]                                显示帮助
+
+首次使用请先运行 ./install.sh 安装依赖。
+EOF
+}
+
+# 电子书脚本无参数时打印用法并以 1 退出；help 场景下吞掉退出码
+ebook_help() {
+  "$EBOOK_DIR/$1" 2>&1 || true
+}
+
+run_command() {
+  local cmd=$1
+  shift
+  case "$cmd" in
+    book2pdf|epub2pdf|djvu2pdf)
+      local script
+      case "$cmd" in
+        book2pdf) script=book_to_pdf.sh ;;
+        epub2pdf) script=epub_to_pdf.sh ;;
+        djvu2pdf) script=djvu_to_pdf.sh ;;
+      esac
+      if [[ $# -eq 0 || "$1" == -h || "$1" == --help ]]; then
+        ebook_help "$script"
+        [[ $# -eq 0 ]] && return 1
+        return 0
+      fi
+      exec "$EBOOK_DIR/$script" "$@"
+      ;;
+    md2word)
+      exec "$(python_bin)" "$MD2WORD_DIR/md_to_apa_word.py" "$@"
+      ;;
+    doctor)
+      doctor
+      ;;
+    help|-h|--help)
+      if [[ $# -gt 0 && "$1" != help ]]; then
+        run_command "$1" --help
+      else
+        usage
+      fi
+      ;;
+    *)
+      echo "错误: 未知命令「$cmd」" >&2
+      echo >&2
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+check() {
+  local label=$1 ok=$2 hint=$3
+  if [[ "$ok" == true ]]; then
+    printf '  [OK]   %s\n' "$label"
+  else
+    printf '  [缺失] %s  -> %s\n' "$label" "$hint"
+    MISSING=$((MISSING + 1))
+  fi
+}
+
+has() { command -v "$1" &>/dev/null && echo true || echo false; }
+
+doctor() {
+  MISSING=0
+  local py
+  py=$(python_bin)
+
+  echo "Python: $py"
+  check "python3" "$(has "$py")" "安装 Python 3"
+  local docx_ok=false
+  "$py" -c "import docx" &>/dev/null && docx_ok=true
+  check "python-docx（md2word）" "$docx_ok" "./install.sh"
+
+  echo "电子书工具:"
+  local calibre_ok=false
+  if [[ -n "${CALIBRE_EBOOK_CONVERT:-}" && -x "$CALIBRE_EBOOK_CONVERT" ]] \
+    || [[ -x /Applications/calibre.app/Contents/MacOS/ebook-convert ]] \
+    || command -v ebook-convert &>/dev/null; then
+    calibre_ok=true
+  fi
+  check "ebook-convert / Calibre（epub2pdf）" "$calibre_ok" "./install.sh --system"
+  check "ddjvu / DjVuLibre（djvu2pdf）" "$(has ddjvu)" "./install.sh --system"
+  local im_ok=false
+  { command -v magick || command -v convert; } &>/dev/null && im_ok=true
+  check "magick / ImageMagick（djvu2pdf）" "$im_ok" "./install.sh --system"
+
+  echo
+  if [[ $MISSING -eq 0 ]]; then
+    echo "全部依赖已就绪。"
+  else
+    echo "缺少 $MISSING 项依赖；对应命令在安装前无法使用。"
+    return 1
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+run_command "$@"
