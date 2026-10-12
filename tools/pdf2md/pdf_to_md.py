@@ -1094,6 +1094,8 @@ def choose_structure(analysis: Analysis, doc, pages: List[Page], requested: str)
     raise SystemExit("错误: 无法确定章节结构（" + "；".join(tried) + "）")
 
 
+GOOGLE_NOTICE_RE = re.compile(r"(?i)digitized\s+by\s+google|books\.google\.com|google\s+book\s+search")
+
 JUNK_META_RE = re.compile(
     r"(?i)^(untitled|unknown|user|admin(istrator)?|owner|author|python-docx|microsoft (office )?(word|user)"
     r"|.*\.(docx?|pdf|indd|tex|rtf|odt|qxd))$"
@@ -1164,6 +1166,8 @@ def convert(pdf_path: Path, out_path: Optional[Path], args) -> None:
             lines = [l for l in lines if re.sub(r"\d+", "#", norm(l.text)) not in repeated]
         if ocr and is_garbage_page(lines, counts):
             dropped += 1
+            continue
+        if GOOGLE_NOTICE_RE.search(" ".join(l.text for l in lines[:12])):
             continue
         lines, notes = split_footnotes(page, lines, body_height, doc_pitch or line_pitch(lines))
         for h in by_page.get(page.index, []):
