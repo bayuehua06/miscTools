@@ -18,10 +18,23 @@ Markdown front matter（可选）:
   date: October 12, 2026
   ---
 
+标题下若紧跟若干短行（同一段里用两个空格换行，或连续几个单行短段），
+且 front matter 没有作者等信息，这些行会居中放到标题页，不再进入正文:
+
+  # Paper Title
+
+  Author Name  
+  Department, University  
+  Course Name  
+  Instructor: Name  
+  October 12, 2026
+
+声明「不属于提交稿」的转换说明（标题后的 blockquote）不会写入 Word。
+
 APA 约定（学生论文）:
   - US Letter、四边 1 英寸边距
   - Times New Roman 12pt、全文双倍行距
-  - 标题页（有元数据时）
+  - 标题页（有元数据，或标题下有上述短行时）
   - 正文首行缩进 0.5"
   - 章节标题 → Word Heading 1–5（导航窗格可用），外观按 APA；
     # 用作论文标题时，## 对应一级标题
@@ -691,31 +704,36 @@ def write_list_item(doc: Document, numbering: ListNumbering, block: Block):
     add_inline_runs(p, block.segs)
 
 
-def write_title_page(doc: Document, meta: Meta):
+def write_title_page(doc: Document, meta: Meta, extra_lines: Optional[List[str]] = None):
     for _ in range(3):
         p = doc.add_paragraph()
-        set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER)
+        set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0))
 
     title = meta.title or "Untitled Paper"
     p = doc.add_paragraph()
-    set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER)
+    set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0))
     run = p.add_run(title)
     set_run_font(run, bold=True)
 
     blank = doc.add_paragraph()
-    set_paragraph_format(blank, align=WD_ALIGN_PARAGRAPH.CENTER)
+    set_paragraph_format(blank, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0))
 
-    for value in (
-        meta.author,
-        meta.affiliation,
-        meta.course,
-        meta.instructor,
-        meta.date,
-    ):
-        if not value:
-            continue
+    values = [ln for ln in (extra_lines or []) if ln.strip()]
+    if not values:
+        values = [
+            v
+            for v in (
+                meta.author,
+                meta.affiliation,
+                meta.course,
+                meta.instructor,
+                meta.date,
+            )
+            if v
+        ]
+    for value in values:
         p = doc.add_paragraph()
-        set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER)
+        set_paragraph_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, first_line_indent=Inches(0))
         run = p.add_run(value)
         set_run_font(run)
 
@@ -959,6 +977,89 @@ def heading_plain_text(block: Block) -> str:
     return "".join(s.text for s in block.segs).strip()
 
 
+COVER_LINE_MAX = 90
+
+
+def block_plain_lines(block: Block) -> List[str]:
+    """按硬换行拆成行。软换行在解析时已变成空格。"""
+    parts: List[str] = []
+    buf: List[str] = []
+    for seg in block.segs:
+        if seg.text == "\n":
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(seg.text)
+    parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def is_short_cover_line(line: str) -> bool:
+    line = line.strip()
+    if not line or len(line) > COVER_LINE_MAX:
+        return False
+    if re.search(r"[.!?]\s+\S", line):
+        return False
+    if line.endswith((".", "?", "!")) and len(line) > 40:
+        return False
+    return True
+
+
+def take_cover_lines(blocks: List[Block], title: Optional[str]) -> List[str]:
+    """取走标题后的署名短行，供标题页使用。
+
+    两种写法都认：同一段里的硬换行，或连续几个单行短段。
+    长段落、标题、列表不会被拿走。
+    """
+    title_block = find_title_heading(blocks, title)
+    if title_block is None:
+        return []
+    idx = blocks.index(title_block) + 1
+    while idx < len(blocks) and blocks[idx].kind == "hr":
+        idx += 1
+    if idx >= len(blocks) or blocks[idx].kind != "para":
+        return []
+
+    lines = block_plain_lines(blocks[idx])
+    if len(lines) >= 2 and all(is_short_cover_line(ln) for ln in lines) and len(lines) <= 12:
+        blocks.pop(idx)
+        return lines
+
+    collected: List[str] = []
+    end = idx
+    while end < len(blocks) and blocks[end].kind == "para" and len(collected) < 12:
+        one = block_plain_lines(blocks[end])
+        if len(one) != 1 or not is_short_cover_line(one[0]):
+            break
+        collected.append(one[0])
+        end += 1
+    if len(collected) >= 2:
+        del blocks[idx:end]
+        return collected
+    return []
+
+
+def is_conversion_note(block: Block) -> bool:
+    """标题后给转换器用的说明，不属于提交稿。"""
+    if block.kind != "blockquote":
+        return False
+    text = re.sub(r"\s+", " ", "".join(s.text for s in block.segs)).strip().lower()
+    if "not part of the submitted" in text:
+        return True
+    return "presentation note" in text and "conversion" in text
+
+
+def strip_conversion_note(blocks: List[Block], title: Optional[str]) -> None:
+    title_block = find_title_heading(blocks, title)
+    if title_block is None:
+        return
+    idx = blocks.index(title_block) + 1
+    while idx < len(blocks) and blocks[idx].kind == "hr":
+        idx += 1
+    if idx < len(blocks) and is_conversion_note(blocks[idx]):
+        blocks.pop(idx)
+
+
 def find_title_heading(blocks: List[Block], title: Optional[str]) -> Optional[Block]:
     """正文开头与论文标题相同的 # 标题（出现在任何正文内容之前）。"""
     if not title:
@@ -1070,6 +1171,10 @@ def has_title_page_meta(meta: Meta) -> bool:
     return bool(meta.title or meta.author or meta.affiliation or meta.course)
 
 
+def has_identity_meta(meta: Meta) -> bool:
+    return bool(meta.author or meta.affiliation or meta.course or meta.instructor or meta.date)
+
+
 def merge_meta(
     file_meta: Meta, cli_meta: Meta, blocks: List[Block], fallback_title: str
 ) -> Meta:
@@ -1106,13 +1211,18 @@ def convert(md_path: Path, out_path: Path, cli_meta: Meta, *, no_title_page: boo
         fallback_title=md_path.stem.replace("_", " ").replace("-", " "),
     )
 
+    cover_lines: List[str] = []
+    if not has_identity_meta(meta):
+        cover_lines = take_cover_lines(blocks, meta.title)
+    strip_conversion_note(blocks, meta.title)
+
     doc = Document()
     setup_document(doc, meta)
 
     if no_title_page:
         write_body(doc, blocks, title=meta.title)
-    elif has_title_page_meta(meta):
-        write_title_page(doc, meta)
+    elif has_title_page_meta(meta) or cover_lines:
+        write_title_page(doc, meta, extra_lines=cover_lines or None)
         write_body(doc, blocks, title=meta.title, repeat_title=True)
     else:
         write_body(doc, blocks, title=meta.title)
