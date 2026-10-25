@@ -19,6 +19,7 @@ ROOT="$(resolve_root)"
 EBOOK_DIR="$ROOT/tools/ebook"
 MD2WORD_DIR="$ROOT/tools/md2word"
 PDF2MD_DIR="$ROOT/tools/pdf2md"
+PROMPTBATCH_DIR="$ROOT/tools/promptbatch"
 
 python_bin() {
   if [[ -x "$ROOT/.venv/bin/python" ]]; then
@@ -42,6 +43,10 @@ Markdown → Word
 
 PDF → Markdown
   pdf2md    <输入.pdf> [-o 输出.md] [选项]     书籍 PDF 转 Markdown，自动识别章节（选项见 pdf2md --help）
+
+CSV → OpenAI Batch → Markdown
+  promptbatch generate-csv <目录.md> [-o 输出.csv] [--country 国家]  从国家分节的 Markdown 表生成 CSV
+  promptbatch <输入.csv> -o <输出目录> [选项]       批量提交 prompt，完成后写成 Markdown（选项见 promptbatch --help）
 
 其他
   doctor                                     检查依赖是否就绪
@@ -79,6 +84,9 @@ run_command() {
       ;;
     pdf2md)
       exec "$(python_bin)" "$PDF2MD_DIR/pdf_to_md.py" "$@"
+      ;;
+    promptbatch)
+      exec "$(python_bin)" "$PROMPTBATCH_DIR/prompt_batch.py" "$@"
       ;;
     doctor)
       doctor
@@ -127,6 +135,14 @@ doctor() {
   local pymupdf_ok=false
   "$py" -c "import pymupdf" &>/dev/null && pymupdf_ok=true
   check "PyMuPDF（pdf2md）" "$pymupdf_ok" "./install.sh"
+  local openai_ok=false
+  "$py" -c "import openai" &>/dev/null && openai_ok=true
+  check "openai（promptbatch）" "$openai_ok" "./install.sh"
+  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    printf '  [OK]   %s\n' "OPENAI_API_KEY（promptbatch）"
+  else
+    printf '  [可选] %s  -> %s\n' "OPENAI_API_KEY（promptbatch）" "export OPENAI_API_KEY=...（只在使用 promptbatch 时需要）"
+  fi
 
   echo "电子书工具:"
   local calibre_ok=false
