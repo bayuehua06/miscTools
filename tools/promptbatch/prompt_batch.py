@@ -8,7 +8,7 @@
   ./misctools promptbatch generate-csv 目录.md --country Afghanistan
   ./misctools promptbatch prompts.csv -o ./out
   ./misctools promptbatch prompts.csv -o ./out --limit 2
-  ./misctools promptbatch prompts.csv -o ./out --dry-run
+  ./misctools promptbatch prompts.csv -o ./out --instructions 协议.md --context 资料.md
 
 批次提交后在 OpenAI 侧排队，最迟 24 小时内完成。电脑可以关机。
 再次执行同一条命令时，若批次已完成，就把 Markdown 写到 -o 目录；
@@ -350,8 +350,19 @@ def _trim_filename(heading: str, row_id: str, fallback_id: str) -> str:
     return f"{stem}-{row_id}.md"
 
 
-def compose_input(prompt: str, dependencies: Sequence[Tuple[str, str, str]], suffix: str) -> str:
-    parts = [prompt.strip(), ""]
+def compose_input(
+    prompt: str,
+    dependencies: Sequence[Tuple[str, str, str]],
+    suffix: str,
+    contexts: Sequence[Tuple[str, str]] = (),
+) -> str:
+    parts: List[str] = []
+    for name, text in contexts:
+        parts.append(f"参考文档（{name}）开始")
+        parts.append(text.rstrip())
+        parts.append("参考文档结束")
+        parts.append("")
+    parts.extend([prompt.strip(), ""])
     for dep_id, title, text in dependencies:
         label = f"编号 {dep_id}" + (f"，{title}" if title else "")
         parts.append(f"依赖输出（{label}）开始")
@@ -556,12 +567,21 @@ def make_custom_id(row_id: str, attempt: int, used: set) -> str:
         suffix += 1
 
 
-def build_request(custom_id: str, model: str, text: str, max_output_tokens: int, reasoning: Optional[str]) -> dict:
+def build_request(
+    custom_id: str,
+    model: str,
+    text: str,
+    max_output_tokens: int,
+    reasoning: Optional[str],
+    instructions: str = "",
+) -> dict:
     body = {
         "model": model,
         "input": text,
         "max_output_tokens": max_output_tokens,
     }
+    if instructions.strip():
+        body["instructions"] = instructions.strip()
     if reasoning:
         body["reasoning"] = {"effort": reasoning}
     return {
@@ -586,8 +606,20 @@ def dependency_texts(row: Row, state: dict, output_dir: Path) -> List[Tuple[str,
     return texts
 
 
-def composed_text(row: Row, state: dict, output_dir: Path, suffix: str) -> str:
-    return compose_input(row.prompt, dependency_texts(row, state, output_dir), suffix)
+def composed_text(
+    row: Row,
+    state: dict,
+    output_dir: Path,
+    suffix: str,
+    contexts: Sequence[Tuple[str, str]] = (),
+) -> str:
+    return compose_input(row.prompt, dependency_texts(row, state, output_dir), suffix, contexts)
+
+
+def request_fingerprint(text: str, instructions: str) -> str:
+    if instructions.strip():
+        return sha256_text(instructions.strip() + "\n" + text)
+    return sha256_text(text)
 
 
 def load_state(path: Path) -> Optional[dict]:
@@ -616,6 +648,47 @@ def load_suffix(args: argparse.Namespace) -> str:
             die(f"找不到后缀文件: {path}")
         return read_text(path).strip() + "\n"
     return DEFAULT_SUFFIX
+
+
+def load_markdown_file(path: Path, label: str) -> str:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        die(f"找不到{label}: {resolved}")
+    text = read_text(resolved).strip()
+    if not text:
+        die(f"{label}是空的: {resolved}")
+    return text
+
+
+def load_shared_materials(
+    instruction_path: Optional[Path],
+    context_paths: Sequence[Path],
+) -> Tuple[str, List[Tuple[str, str]]]:
+    instructions = load_markdown_file(instruction_path, "自定义说明") if instruction_path else ""
+    contexts: List[Tuple[str, str]] = []
+    used_labels = set()
+    seen_paths = set()
+    for raw in context_paths:
+        resolved = raw.expanduser().resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        text = load_markdown_file(resolved, "参考文档")
+        label = resolved.name
+        if label in used_labels:
+            label = f"{resolved.parent.name}/{resolved.name}"
+        used_labels.add(label)
+        contexts.append((label, text))
+    return instructions, contexts
+
+
+def print_materials(instruction_path: Optional[Path], instructions: str, contexts: Sequence[Tuple[str, str]]) -> None:
+    if instruction_path:
+        print(f"自定义说明: {instruction_path}（{len(instructions)} 字符），每条请求都会带上")
+    if contexts:
+        labels = "、".join(name for name, _ in contexts)
+        chars = sum(len(text) for _, text in contexts)
+        print(f"参考文档: {labels}（合计 {chars} 字符）。每条请求都会带上，输入费用按条数相乘")
 
 
 def iter_jsonl(text: str) -> List[dict]:
@@ -715,7 +788,14 @@ def dependencies_on_disk(row: Row, state: dict, output_dir: Path) -> bool:
     return True
 
 
-def changed_prompt_notes(rows: Sequence[Row], state: dict, output_dir: Path, suffix: str) -> List[str]:
+def changed_prompt_notes(
+    rows: Sequence[Row],
+    state: dict,
+    output_dir: Path,
+    suffix: str,
+    contexts: Sequence[Tuple[str, str]] = (),
+    instructions: str = "",
+) -> List[str]:
     notes = []
     stored_suffix = state.get("suffix_sha256")
     suffix_changed = bool(stored_suffix) and stored_suffix != sha256_text(suffix)
@@ -726,9 +806,9 @@ def changed_prompt_notes(rows: Sequence[Row], state: dict, output_dir: Path, suf
         stored = current.get("prompt_sha256")
         if not stored or not dependencies_on_disk(row, state, output_dir):
             continue
-        digest = sha256_text(composed_text(row, state, output_dir, suffix))
+        digest = request_fingerprint(composed_text(row, state, output_dir, suffix, contexts), instructions)
         if digest != stored or suffix_changed:
-            notes.append(f"编号 {row.id} 的正文或后缀已改变，这一批仍使用提交时的内容")
+            notes.append(f"编号 {row.id} 的正文、参考文档、说明或后缀已改变，这一批仍使用提交时的内容")
     return notes
 
 
@@ -738,6 +818,11 @@ def select_chunk(requests: Sequence[dict]) -> List[dict]:
     for request in requests:
         encoded = json.dumps(request, ensure_ascii=False).encode("utf-8")
         extra = len(encoded) + 1
+        if extra > MAX_JSONL_BYTES:
+            die(
+                f"单条请求有 {extra / (1024 * 1024):.1f} MB，超过批次文件上限。"
+                "请缩小 --context 或 --instructions。"
+            )
         if chosen and (len(chosen) >= MAX_REQUESTS or size + extra > MAX_JSONL_BYTES):
             break
         chosen.append(request)
@@ -831,6 +916,8 @@ def prepare_requests(
     model: str,
     max_output_tokens: int,
     reasoning: Optional[str],
+    contexts: Sequence[Tuple[str, str]] = (),
+    instructions: str = "",
 ) -> Tuple[List[dict], List[str]]:
     used = {
         row.get("custom_id")
@@ -842,12 +929,12 @@ def prepare_requests(
     for row in rows:
         current = state["rows"][row.id]
         attempt = int(current.get("attempts") or 0) + 1
-        text = composed_text(row, state, output_dir, suffix)
+        text = composed_text(row, state, output_dir, suffix, contexts)
         custom_id = make_custom_id(row.id, attempt, used)
-        requests.append(build_request(custom_id, model, text, max_output_tokens, reasoning))
+        requests.append(build_request(custom_id, model, text, max_output_tokens, reasoning, instructions))
         current["attempts"] = attempt
         current["custom_id"] = custom_id
-        current["prompt_sha256"] = sha256_text(text)
+        current["prompt_sha256"] = request_fingerprint(text, instructions)
         current["error"] = None
         row_ids.append(row.id)
     return requests, row_ids
@@ -1011,6 +1098,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"模型（默认 {DEFAULT_MODEL}）")
     parser.add_argument("--suffix-file", type=Path, default=None, help="用这个文件的全文替换默认后缀")
     parser.add_argument("--no-suffix", action="store_true", help="不在正文末尾追加后缀")
+    parser.add_argument("--instructions", type=Path, default=None, help="自定义说明 Markdown。每条请求都带上，对应 API 的 instructions")
+    parser.add_argument("--context", type=Path, action="append", default=[], help="附加参考文档 Markdown，可重复。跟每条 prompt 一起作为输入")
     parser.add_argument("--limit", type=int, default=None, help="这一次最多提交多少条，便于先试跑")
     parser.add_argument("--yes", action="store_true", help=f"提交超过 {CONFIRM_OVER} 条时不再询问")
     parser.add_argument("--wait", action="store_true", help="提交后保持本机运行，直到这一批完成并写盘。默认提交后立即退出")
@@ -1043,6 +1132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if output_dir.exists() and not output_dir.is_dir():
         die(f"输出路径不是目录: {output_dir}")
     suffix = load_suffix(args)
+    instructions, contexts = load_shared_materials(args.instructions, args.context or [])
+    print_materials(args.instructions, instructions, contexts)
     rows = parse_csv(read_text(csv_path))
     state_path = output_dir / ".promptbatch" / "state.json"
     state, merge_notes = merge_state(rows, load_state(state_path) if state_path.exists() else None, csv_path)
@@ -1058,7 +1149,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     client = make_client()
     output_dir.mkdir(parents=True, exist_ok=True)
-    for note in changed_prompt_notes(rows, state, output_dir, suffix):
+    for note in changed_prompt_notes(rows, state, output_dir, suffix, contexts, instructions):
         print(note)
     interval = max(args.interval, MIN_POLL_SECONDS)
     if args.wait and args.interval < MIN_POLL_SECONDS:
@@ -1119,6 +1210,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.model,
             args.max_output_tokens,
             args.reasoning,
+            contexts,
+            instructions,
         )
         chunk = select_chunk(requests)
         if len(chunk) < len(requests):

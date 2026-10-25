@@ -176,6 +176,7 @@ export OPENAI_API_KEY=sk-...
 ```bash
 ./misctools promptbatch prompts.csv -o ./batch-out --dry-run
 ./misctools promptbatch prompts.csv -o ./batch-out --limit 2
+./misctools promptbatch prompts.csv -o ./batch-out --instructions 协议.md --context 资料甲.md --context 资料乙.md
 ./misctools promptbatch prompts.csv -o ./batch-out --model gpt-6-sol --reasoning high
 ./misctools promptbatch prompts.csv -o ./batch-out
 ./misctools promptbatch prompts.csv -o ./batch-out --retry A-01
@@ -185,7 +186,7 @@ export OPENAI_API_KEY=sk-...
 
 省略 `--model` 时用 `gpt-5.4`。ChatGPT 里付费计划的 Medium / High 若选的是 GPT-6，对应 `--model gpt-6-sol --reasoning medium` 或 `--reasoning high`；若仍停在 GPT-5.6 Sol，把模型名换成 `gpt-5.6-sol`。思考档会把思考 token 按输出计价。
 
-每条正文末尾会自动加上一段要求：只输出最终 Markdown、不要开场、不要询问是否切换 Worker / Work。文件由本工具写盘。用 `--suffix-file` 替换这段话，或用 `--no-suffix` 关掉。`--max-output-tokens` 默认 128000。失败的行下次自动重试，最多 3 次；输出被截断时用 `--retry 编号`。进度在输出目录的 `.promptbatch/state.json`。
+每条正文末尾会自动加上一段要求：只输出最终 Markdown、不要开场、不要询问是否切换 Worker / Work。文件由本工具写盘。用 `--suffix-file` 替换这段话，或用 `--no-suffix` 关掉。`--instructions` 是自定义说明，每条都放进 API 的 instructions。`--context` 是附加文档，可重复，跟该条 prompt 一起作为输入，顺序与参数顺序一致；这些材料按条数重复计费。`--max-output-tokens` 默认 128000。失败的行下次自动重试，最多 3 次；输出被截断时用 `--retry 编号`。进度在输出目录的 `.promptbatch/state.json`。同一批取回时不用再带这些文件；提交下一批时要带上同一组参数。
 
 示例 CSV 见 [`tools/promptbatch/examples/prompts.csv`](tools/promptbatch/examples/prompts.csv)。
 

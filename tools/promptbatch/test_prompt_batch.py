@@ -155,6 +155,14 @@ class OutputTests(unittest.TestCase):
         self.assertIn("不要询问是否切换到 Worker", text)
         self.assertTrue(text.endswith("\n"))
 
+    def test_context_precedes_prompt_and_instructions_go_in_body(self):
+        text = pb.compose_input("做这件事", [], "收尾", [("协议.md", "# 协议正文")])
+        self.assertLess(text.index("参考文档（协议.md）开始"), text.index("做这件事"))
+        self.assertIn("# 协议正文", text)
+        request = pb.build_request("pb01abc", "gpt-5.4", text, 1000, None, "始终用中文")
+        self.assertEqual(request["body"]["instructions"], "始终用中文")
+        self.assertNotIn("始终用中文", request["body"]["input"])
+
 
 class StateTests(unittest.TestCase):
     def test_merge_keeps_done_status(self):
