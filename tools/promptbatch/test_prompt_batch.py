@@ -36,6 +36,7 @@ class CatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "out.csv"
             pb.write_prompt_csv(rows, path)
+            self.assertTrue(path.read_bytes().startswith(b"\xef\xbb\xbf"))
             parsed = pb.parse_csv(path.read_text(encoding="utf-8"))
         self.assertEqual([(row.id, row.prompt) for row in parsed], [(row.id, row.prompt) for row in rows])
 

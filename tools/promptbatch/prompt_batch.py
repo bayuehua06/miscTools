@@ -180,7 +180,8 @@ def _catalog_separator(cells: Sequence[str]) -> bool:
 def write_prompt_csv(rows: Sequence[Row], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
+    # utf-8-sig 写入 BOM。Excel 靠它识别 UTF-8；没有 BOM 时中文会按系统编码打开而乱码。
+    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["编号", "标题", "正文"])
         for row in rows:

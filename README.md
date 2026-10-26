@@ -169,7 +169,7 @@ export OPENAI_API_KEY=sk-...
 ./misctools promptbatch generate-csv 目录.md --country Afghanistan
 ```
 
-`--country` 只保留该 `##` 标题下的行，大小写不敏感，可写成 `Afghanistan` 或 `## Afghanistan`。不写 `-o` 时，指定国家会写成 `目录-Afghanistan.csv`，避免覆盖整本 CSV。
+`--country` 只保留该 `##` 标题下的行，大小写不敏感，可写成 `Afghanistan` 或 `## Afghanistan`。不写 `-o` 时，指定国家会写成 `目录-Afghanistan.csv`，避免覆盖整本 CSV。写出的 CSV 是带 BOM 的 UTF-8，Excel 才能正确显示中文。
 
 批量提交。CSV 三列是编号、标题、正文，表头可写 `编号,标题,正文` 或 `id,title,prompt`，也可以不写表头。可选第 4 列 `依赖` / `depends_on`，多个编号用逗号或分号分开。没有依赖的行进同一批；有依赖的行要等对方的 Markdown 写盘后，再执行同一条命令提交下一批。
 
